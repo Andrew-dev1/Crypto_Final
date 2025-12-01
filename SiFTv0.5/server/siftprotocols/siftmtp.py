@@ -30,6 +30,7 @@ class SiFT_MTP:
 		self.size_msg_hdr_rsv = 2
 		self.msg_hdr_rsv = b'\x00\x00'
 		self.size_mac = 12
+		self.etk_size = 256
   
 		self.type_login_req =    b'\x00\x00'
 		self.type_login_res =    b'\x00\x10'
@@ -49,7 +50,7 @@ class SiFT_MTP:
 		# --------- VARIABLES ------------
 		self.snd_counter = 1
 		self.rcv_counter = 0
-		self.final_transfer_key = b'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A'
+		self.final_transfer_key = b''
   
 		# --------- STATE ------------
 		self.peer_socket = peer_socket
@@ -133,6 +134,16 @@ class SiFT_MTP:
 
 		return parsed_msg_hdr['typ'], msg_body
 
+	def load_keypair(self,privkeyfile): # change or no
+		# passphrase = getpass.getpass('Enter a passphrase to decode the saved private key: ')
+		passphrase = '12345'
+		with open(privkeyfile, 'rb') as f:
+			keypairstr = f.read()
+		try:
+			return RSA.import_key(keypairstr, passphrase=passphrase)
+		except SiFT_MTP_Error as e:
+			raise SiFT_MTP_Error('Can load key --> ' + e.err_msg)
+    
 	# receives and parses message, returns msg_type and msg_payload
 	def receive_msg(self):
 
@@ -159,34 +170,43 @@ class SiFT_MTP:
 		msg_len = int.from_bytes(parsed_msg_hdr['len'], byteorder='big')
 		plaintext = b''
 		try:
-			msg_body = self.receive_bytes(msg_len - self.size_msg_hdr2)
+			msg_body = self.receive_bytes(msg_len - self.size_msg_hdr2)    
+		except SiFT_MTP_Error as e:
+			raise SiFT_MTP_Error('Unable to receive message body --> ' + e.err_msg)
 
-			
+		# server side 
+		if parsed_msg_hdr['typ'] == self.type_login_req:
+			etk = msg_body[-256:]  # encrypted AES key from the login message
+			keypair = self.load_keypair('privkeyfile.pem')
+			RSAcipher = PKCS1_OAEP.new(keypair)
+   
 			try:
-				nonce = parsed_msg_hdr['sqn'] + parsed_msg_hdr['rnd']
-				mac = msg_body[-(self.size_mac):]
-				epd = msg_body[:-(self.size_mac)]
-				# print("\nExtracted nonce:", nonce.hex())
-				# print("Extracted MAC:", mac.hex())
-				# print("Extracted encrypted payload (epd):", epd.hex())
-
+				tk = RSAcipher.decrypt(etk)
+			except SiFT_MTP_Error as e:
+				raise SiFT_MTP_Error('Unable to decrypt AES key --> ' + e.err_msg)
+			nonce = parsed_msg_hdr['sqn'] + parsed_msg_hdr['rnd']
+			mac = msg_body[-(self.size_mac+ self.etk_size): -self.etk_size]
+			epd = msg_body[:-(self.size_mac+ self.etk_size)]
+   
+			cipher = AES.new(tk, AES.MODE_GCM, nonce=nonce, mac_len=12)
+			cipher.update(msg_hdr)
+			self.final_transfer_key = tk
+   
+		else:
+			nonce = parsed_msg_hdr['sqn'] + parsed_msg_hdr['rnd']
+			mac = msg_body[-(self.size_mac):]
+			epd = msg_body[:-(self.size_mac)]	
+			try:
 				cipher = AES.new(self.final_transfer_key, AES.MODE_GCM, nonce=nonce, mac_len=self.size_mac)
 				cipher.update(msg_hdr)
 
-				try:
-					plaintext = cipher.decrypt_and_verify(epd, mac)
-					# print("MAC verification successful.")
-					# print("Plaintext:")
-					# print(plaintext.decode("utf-8"))
-					self.rcv_counter += 1
-				except SiFT_MTP_Error as e:
-					raise SiFT_MTP_Error('MAC verification failed--> ' + e.err_msg)
-    
 			except SiFT_MTP_Error as e:
 				raise SiFT_MTP_Error('Error: Cannot extract fields from message body.')
-    
+
+		try:
+			plaintext = cipher.decrypt_and_verify(epd, mac)
 		except SiFT_MTP_Error as e:
-			raise SiFT_MTP_Error('Unable to receive message body --> ' + e.err_msg)
+			raise SiFT_MTP_Error('MAC verification failed--> ' + e.err_msg)
 
 		# DEBUG, ignore
 		if self.DEBUG:
@@ -199,6 +219,7 @@ class SiFT_MTP:
 
 		if len(msg_body) != msg_len - self.size_msg_hdr2: 
 			raise SiFT_MTP_Error('Incomplete message body reveived')
+		self.rcv_counter += 1
 		return parsed_msg_hdr['typ'], plaintext
 
 	# sends all bytes provided via the peer socket
@@ -243,16 +264,13 @@ class SiFT_MTP:
 		rsv = self.msg_hdr_rsv
   
 		msg_hdr = self.msg_hdr_ver2 + msg_type + msg_hdr_len + msg_hdr_sqn + rnd + rsv
-		# increment send counter
-		self.snd_counter += 1
+		
   
 		#Encrypting payload before sending
 		nonce = msg_hdr_sqn + rnd              # 8 bytes total (as required by SiFT)
 		cipher = AES.new(self.final_transfer_key, AES.MODE_GCM, nonce=nonce, mac_len=self.size_mac)
 		cipher.update(msg_hdr)
 		epd, mac = cipher.encrypt_and_digest(msg_payload)
-		print("Header:", msg_hdr.hex(), "Length:", len(msg_hdr))
-		print("MAC:", mac.hex())
 		encrypted_msg_payload = epd + mac
 
 		# DEBUG, irrelevant
@@ -267,5 +285,7 @@ class SiFT_MTP:
 		# try to send
 		try:
 			self.send_bytes(msg_hdr + encrypted_msg_payload)
+   			# increment send counter
+			self.snd_counter += 1
 		except SiFT_MTP_Error as e:
 			raise SiFT_MTP_Error('Unable to send message to peer --> ' + e.err_msg)
